@@ -1,0 +1,146 @@
+# git-assist — local stack. Secrets come from .env (gitignored; see .env.example).
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    ports: ["6333:6333"]
+    volumes: [qdrant_data:/qdrant/storage]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["5432:5432"]
+    volumes: [pg_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: "${NEO4J_AUTH}"
+    ports: ["7474:7474", "7687:7687"]
+    volumes: [neo4j_data:/data]
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Serves Qwen3-Embedding-4B, Qwen3-Reranker-0.6B (decoder-only, scored via yes/no token
+  # logits — see rerank.py) and a Qwen3 chat model for generation + HyDE.
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: [ollama_data:/root/.ollama]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    entrypoint:
+      - sh
+      - -c
+      - >
+        ollama pull hf.co/QuantFactory/Qwen3-Reranker-0.6B-GGUF:Q4_K_M &&
+        ollama pull qwen3-embedding:4b &&
+        ollama pull qwen3:4b
+    environment:
+      OLLAMA_HOST: "ollama:11434"
+    depends_on:
+      ollama: {condition: service_healthy}
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: api
+    ports: ["8000:8000"]
+    env_file: .env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      qdrant: {condition: service_healthy}
+      neo4j: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      ollama-pull: {condition: service_completed_successfully}
+
+  worker:
+    build: .
+    command: uvicorn worker.asgi:app --host 0.0.0.0 --port 8001
+    ports: ["8001:8001"]
+    env_file: .env
+    volumes:
+      - "secrets_vol:/run/secrets:ro"
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      qdrant: {condition: service_healthy}
+      neo4j: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      ollama-pull: {condition: service_completed_successfully}
+      gitlab-setup: {condition: service_completed_successfully}
+
+  gitlab:
+    image: gitlab/gitlab-ce:17.0.0-ce.0
+    ports: ["8929:80", "2222:22"]
+    environment:
+      GITLAB_ROOT_PASSWORD: ${GITLAB_ROOT_PASSWORD}
+      EXTERNAL_URL: "http://localhost:8929"
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/-/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  gitlab-setup:
+    image: python:3.12-slim
+    command: python /setup/setup.py
+    volumes:
+      - "./scripts/gitlab_setup.py:/setup/setup.py:ro"
+      - "secrets_vol:/run/secrets"
+    environment:
+      GITLAB_URL: "http://gitlab"
+      GITLAB_ROOT_PASSWORD: ${GITLAB_ROOT_PASSWORD}
+      GITLAB_PROJECT_NAME: ${GITLAB_PROJECT_NAME:-git-assist-repo}
+      GITLAB_WEBHOOK_SECRET: ${GITLAB_WEBHOOK_SECRET}
+      WORKER_WEBHOOK_URL: "http://worker:8001/webhook"
+    depends_on:
+      gitlab: {condition: service_healthy}
+
+volumes:
+  qdrant_data:
+  pg_data:
+  neo4j_data:
+  ollama_data:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:
+  secrets_vol:

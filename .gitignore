@@ -1,0 +1,22 @@
+# Environments
+.venv/
+
+# Secrets
+.env
+
+# Build artifacts
+dist/
+*.egg-info/
+
+# Caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
+
+# Run logs
+logs/
